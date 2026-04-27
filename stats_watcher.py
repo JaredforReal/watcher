@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 HF_ORG = os.environ["HF_ORG"]
+MS_ORG = os.environ["MS_ORG"]
 FEISHU_APP_ID = os.environ["FEISHU_APP_ID"]
 FEISHU_APP_SECRET = os.environ["FEISHU_APP_SECRET"]
 FEISHU_BASE_TOKEN = os.environ["FEISHU_BASE_TOKEN"]
@@ -31,6 +32,12 @@ def get_hf_downloads(model_id):
     url = f"https://huggingface.co/api/models/{model_id}?expand[]=downloadsAllTime"
     res = requests.get(url, timeout=10)
     return res.json().get("downloadsAllTime", 0)
+
+
+def get_ms_downloads(model_id):
+    url = f"https://modelscope.cn/api/v1/models/{model_id}"
+    res = requests.get(url, timeout=10)
+    return res.json().get("Data", {}).get("Downloads", 0)
 
 
 def get_all_records(token):
@@ -82,10 +89,14 @@ def main():
     # 解析表格记录
     model_records = []  # [{model_id, record_id, github_repo}]
     repo_to_records = {}  # repo -> [(record_id, model_id)]
+    total_record_id = None
     for item in records:
         fields = item.get("fields", {})
         model_id = extract_text(fields.get("Model ID"))
         github_repo = extract_text(fields.get("GitHub Repo"))
+        if model_id == "Total":
+            total_record_id = item["record_id"]
+            continue
         if not model_id:
             continue
         model_records.append({
@@ -96,15 +107,36 @@ def main():
         if github_repo:
             repo_to_records.setdefault(github_repo, []).append((item["record_id"], model_id))
 
-    # 采集并更新 HF 下载量（表格 Model ID -> zai-org/Model ID）
-    print("\n--- 更新 HF 下载量 ---")
+    # 采集并更新 HF 下载量 + 魔搭下载量
+    total_hf = 0
+    total_ms = 0
+    print("\n--- 更新 HF & 魔搭下载量 ---")
     for r in model_records:
-        hf_id = f"{HF_ORG}/{r['model_id']}"
-        downloads = get_hf_downloads(hf_id)
-        res = update_record(token, r["record_id"], {"HF总下载量": downloads})
+        model_id = r["model_id"]
+        hf_id = f"{HF_ORG}/{model_id}"
+        ms_id = f"{MS_ORG}/{model_id}"
+
+        hf_downloads = get_hf_downloads(hf_id)
+        ms_downloads = get_ms_downloads(ms_id)
+        total_hf += hf_downloads
+        total_ms += ms_downloads
+
+        res = update_record(token, r["record_id"], {
+            "HF总下载量": hf_downloads,
+            "魔搭总下载量": ms_downloads,
+        })
         status = "OK" if res.get("code") == 0 else res.get("msg")
-        print(f"  {r['model_id']}: {downloads} -> {status}")
-        time.sleep(0.5)
+        print(f"  {model_id}: HF={hf_downloads}, 魔搭={ms_downloads} -> {status}")
+        time.sleep(0.2)
+
+    # 更新 Total 行
+    if total_record_id:
+        res = update_record(token, total_record_id, {
+            "HF总下载量": total_hf,
+            "魔搭总下载量": total_ms,
+        })
+        status = "OK" if res.get("code") == 0 else res.get("msg")
+        print(f"\n  Total: HF={total_hf}, 魔搭={total_ms} -> {status}")
 
     # 采集并更新 GitHub Stars（表格 GitHub Repo -> zai-org/Repo）
     print("\n--- 更新 GitHub Stars ---")
@@ -115,7 +147,7 @@ def main():
             res = update_record(token, record_id, {"GitHub Stars": stars})
             status = "OK" if res.get("code") == 0 else res.get("msg")
             print(f"  {repo} -> {model_id}: {stars} stars ({status})")
-        time.sleep(0.5)
+        time.sleep(0.2)
 
     print("\nDone!")
 
