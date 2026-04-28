@@ -1,6 +1,7 @@
 import os
 import requests
 import time
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,8 +11,8 @@ MS_ORG = os.environ["MS_ORG"]
 FEISHU_APP_ID = os.environ["FEISHU_APP_ID"]
 FEISHU_APP_SECRET = os.environ["FEISHU_APP_SECRET"]
 FEISHU_BASE_TOKEN = os.environ["FEISHU_BASE_TOKEN"]
-FEISHU_TABLE_ID = os.environ["FEISHU_TABLE_ID"]
-# ====================================================
+FEISHU_DOWNLOADS_TABLE_ID = os.environ["FEISHU_DOWNLOADS_TABLE_ID"]
+FEISHU_REPO_STARS_TABLE_ID = os.environ["FEISHU_REPO_STARS_TABLE_ID"]
 
 
 def get_feishu_token():
@@ -25,7 +26,11 @@ def get_feishu_token():
 
 def get_github_star(repo):
     res = requests.get(f"https://api.github.com/repos/{repo}", timeout=10)
-    return res.json().get("stargazers_count", 0)
+    data = res.json()
+    if res.status_code != 200:
+        print(f"    ⚠ GitHub repo {repo} 请求失败: {data.get('message', res.status_code)}")
+        return None
+    return data.get("stargazers_count", 0)
 
 
 def get_hf_downloads(model_id):
@@ -40,10 +45,13 @@ def get_ms_downloads(model_id):
     return res.json().get("Data", {}).get("Downloads", 0)
 
 
-def get_all_records(token):
+def get_all_records(token, is_downloads=True):
     """读取飞书表格全部记录，返回完整的记录列表"""
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{FEISHU_TABLE_ID}/records/search"
+    if is_downloads:
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{FEISHU_DOWNLOADS_TABLE_ID}/records/search"
+    else:
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{FEISHU_REPO_STARS_TABLE_ID}/records/search"
 
     all_records = []
     page_token = None
@@ -64,8 +72,28 @@ def get_all_records(token):
             break
         page_token = res["data"].get("page_token")
 
-    print(f"飞书表格共 {len(all_records)} 条记录")
+    table_name = "Downloads" if is_downloads else "Stars"
+    print(f"{table_name} 表共 {len(all_records)} 条记录")
     return all_records
+
+
+def create_record(token, fields, is_downloads=True):
+    """向飞书表格新增一条记录 (POST)"""
+    table_id = FEISHU_DOWNLOADS_TABLE_ID if is_downloads else FEISHU_REPO_STARS_TABLE_ID
+    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{table_id}/records"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    res = requests.post(url, headers=headers, json={"fields": fields})
+    return res.json()
+
+
+def update_record(token, record_id, fields, is_downloads=True):
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    if is_downloads:
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{FEISHU_DOWNLOADS_TABLE_ID}/records/{record_id}"
+    else:
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{FEISHU_REPO_STARS_TABLE_ID}/records/{record_id}"
+    res = requests.put(url, headers=headers, json={"fields": fields})
+    return res.json()
 
 
 def extract_text(field_value):
@@ -75,79 +103,96 @@ def extract_text(field_value):
     return str(field_value) if field_value else ""
 
 
-def update_record(token, record_id, fields):
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{FEISHU_TABLE_ID}/records/{record_id}"
-    res = requests.put(url, headers=headers, json={"fields": fields})
-    return res.json()
+def get_today_range():
+    """返回今天 00:00:00 和 23:59:59 的毫秒时间戳"""
+    today = datetime.now().date()
+    start = int(datetime.combine(today, datetime.min.time()).timestamp() * 1000)
+    end = int(datetime.combine(today, datetime.max.time()).timestamp() * 1000)
+    return start, end
+
+
+def is_today(date_val, today_start, today_end):
+    """判断飞书日期字段值是否为今天"""
+    if not date_val:
+        return False
+    ts = int(date_val)
+    return today_start <= ts <= today_end
 
 
 def main():
     token = get_feishu_token()
-    records = get_all_records(token)
+    today_start, today_end = get_today_range()
 
-    # 解析表格记录
-    model_records = []  # [{model_id, record_id, github_repo}]
-    repo_to_records = {}  # repo -> [(record_id, model_id)]
-    total_record_id = None
-    for item in records:
+    # --- Downloads 表 ---
+    print("\n--- 更新 HF & 魔搭下载量 ---")
+    dl_records = get_all_records(token, is_downloads=True)
+    model_ids = set()
+    today_dl_map = {}  # model_id -> record_id
+    for item in dl_records:
         fields = item.get("fields", {})
         model_id = extract_text(fields.get("Model ID"))
-        github_repo = extract_text(fields.get("GitHub Repo"))
-        if model_id == "Total":
-            total_record_id = item["record_id"]
+        if not model_id or model_id == "Total":
             continue
-        if not model_id:
-            continue
-        model_records.append({
-            "model_id": model_id,
-            "record_id": item["record_id"],
-            "github_repo": github_repo,
-        })
-        if github_repo:
-            repo_to_records.setdefault(github_repo, []).append((item["record_id"], model_id))
+        model_ids.add(model_id)
+        if is_today(fields.get("日期"), today_start, today_end):
+            today_dl_map[model_id] = item["record_id"]
 
-    # 采集并更新 HF 下载量 + 魔搭下载量
-    total_hf = 0
-    total_ms = 0
-    print("\n--- 更新 HF & 魔搭下载量 ---")
-    for r in model_records:
-        model_id = r["model_id"]
+    for model_id in sorted(model_ids):
         hf_id = f"{HF_ORG}/{model_id}"
         ms_id = f"{MS_ORG}/{model_id}"
+        hf_dl = get_hf_downloads(hf_id)
+        ms_dl = get_ms_downloads(ms_id)
+        fields = {
+            "Model ID": model_id,
+            "HF总下载量": hf_dl,
+            "魔搭总下载量": ms_dl,
+            "日期": today_start,
+        }
 
-        hf_downloads = get_hf_downloads(hf_id)
-        ms_downloads = get_ms_downloads(ms_id)
-        total_hf += hf_downloads
-        total_ms += ms_downloads
+        if model_id in today_dl_map:
+            res = update_record(token, today_dl_map[model_id], fields, is_downloads=True)
+            action = "更新"
+        else:
+            res = create_record(token, fields, is_downloads=True)
+            action = "新增"
+        status = "OK" if res.get("code") == 0 else res.get("msg", "FAIL")
+        print(f"  [{action}] {model_id}: HF={hf_dl}, 魔搭={ms_dl} -> {status}")
+        time.sleep(0.1)
 
-        res = update_record(token, r["record_id"], {
-            "HF总下载量": hf_downloads,
-            "魔搭总下载量": ms_downloads,
-        })
-        status = "OK" if res.get("code") == 0 else res.get("msg")
-        print(f"  {model_id}: HF={hf_downloads}, 魔搭={ms_downloads} -> {status}")
-        time.sleep(0.2)
-
-    # 更新 Total 行
-    if total_record_id:
-        res = update_record(token, total_record_id, {
-            "HF总下载量": total_hf,
-            "魔搭总下载量": total_ms,
-        })
-        status = "OK" if res.get("code") == 0 else res.get("msg")
-        print(f"\n  Total: HF={total_hf}, 魔搭={total_ms} -> {status}")
-
-    # 采集并更新 GitHub Stars（表格 GitHub Repo -> zai-org/Repo）
+    # --- Stars 表 ---
     print("\n--- 更新 GitHub Stars ---")
-    for repo, recs in repo_to_records.items():
+    star_records = get_all_records(token, is_downloads=False)
+    repos = set()
+    today_star_map = {}  # repo -> record_id
+    for item in star_records:
+        fields = item.get("fields", {})
+        repo = extract_text(fields.get("GitHub Repo"))
+        if not repo or repo == "Total":
+            continue
+        repos.add(repo)
+        if is_today(fields.get("日期"), today_start, today_end):
+            today_star_map[repo] = item["record_id"]
+
+    for repo in sorted(repos):
         full_repo = f"{HF_ORG}/{repo}"
         stars = get_github_star(full_repo)
-        for record_id, model_id in recs:
-            res = update_record(token, record_id, {"GitHub Stars": stars})
-            status = "OK" if res.get("code") == 0 else res.get("msg")
-            print(f"  {repo} -> {model_id}: {stars} stars ({status})")
-        time.sleep(0.2)
+        if stars is None:
+            continue
+        fields = {
+            "GitHub Repo": repo,
+            "GitHub Stars": stars,
+            "日期": today_start,
+        }
+
+        if repo in today_star_map:
+            res = update_record(token, today_star_map[repo], fields, is_downloads=False)
+            action = "更新"
+        else:
+            res = create_record(token, fields, is_downloads=False)
+            action = "新增"
+        status = "OK" if res.get("code") == 0 else res.get("msg", "FAIL")
+        print(f"  [{action}] {repo}: {stars} stars -> {status}")
+        time.sleep(0.1)
 
     print("\nDone!")
 
