@@ -127,6 +127,7 @@ def main():
     print("\n--- 更新 HF & 魔搭下载量 ---")
     dl_records = get_all_records(token, is_downloads=True)
     model_ids = set()
+    model_tags = {}  # model_id -> tag
     today_dl_map = {}  # model_id -> record_id
     for item in dl_records:
         fields = item.get("fields", {})
@@ -134,6 +135,9 @@ def main():
         if not model_id or model_id == "Total":
             continue
         model_ids.add(model_id)
+        tag = extract_text(fields.get("Tag"))
+        if tag and model_id not in model_tags:
+            model_tags[model_id] = tag
         if is_today(fields.get("日期"), today_start, today_end):
             today_dl_map[model_id] = item["record_id"]
 
@@ -148,6 +152,8 @@ def main():
             "魔搭总下载量": ms_dl,
             "日期": today_start,
         }
+        if model_id in model_tags:
+            fields["Tag"] = model_tags[model_id]
 
         if model_id in today_dl_map:
             res = update_record(token, today_dl_map[model_id], fields, is_downloads=True)
