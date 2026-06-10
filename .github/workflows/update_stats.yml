@@ -22,6 +22,11 @@ jobs:
         env:
           HF_ORG: ${{ secrets.HF_ORG }}
           MS_ORG: ${{ secrets.MS_ORG }}
+          GITHUB_ORG: ${{ secrets.GITHUB_ORG }}
+          MODEL_IDS: ${{ secrets.MODEL_IDS }}
+          MODEL_TAGS: ${{ secrets.MODEL_TAGS }}
+          GITHUB_REPOS: ${{ secrets.GITHUB_REPOS }}
+          GITHUB_TOKEN: ${{ github.token }}
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_BASE_TOKEN: ${{ secrets.FEISHU_BASE_TOKEN }}
