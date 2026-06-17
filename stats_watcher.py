@@ -8,7 +8,9 @@ load_dotenv()
 
 HF_ORG = os.environ["HF_ORG"]
 MS_ORG = os.environ["MS_ORG"]
-GITHUB_ORG = os.environ.get("GITHUB_ORG", HF_ORG)
+# 注意：GitHub Actions 里空 secret 仍会注入为 ""（环境变量存在但为空），
+# 所以必须用 `or` 而不是 .get 的默认值，否则空 secret 会盖掉 HF_ORG。
+GITHUB_ORG = os.environ.get("GITHUB_ORG") or HF_ORG
 FEISHU_APP_ID = os.environ["FEISHU_APP_ID"]
 FEISHU_APP_SECRET = os.environ["FEISHU_APP_SECRET"]
 FEISHU_BASE_TOKEN = os.environ["FEISHU_BASE_TOKEN"]
@@ -269,6 +271,67 @@ def get_today_records(client, is_downloads, today_start, today_end):
     return all_records
 
 
+MS_PER_DAY = 86_400_000
+# 以「现有数据」为跟踪来源时，回看多少天的记录来汇总仓库集合。
+# 取近期窗口而非整张历史表：既不必每天全量扫描，也能抵御某一天写入不完整。
+STAR_LOOKBACK_DAYS = int(os.environ.get("STAR_LOOKBACK_DAYS", "7"))
+
+
+def _day_key(date_val):
+    """把毫秒时间戳归一化到「天」（按 UTC 取整），用于按天比较。
+
+    日期字段实际存的是写入时刻的毫秒时间戳，同一天不同记录也各不相同，
+    直接比相等会把同一天误判为多天，所以先归一化到天再比较。
+    """
+    try:
+        return int(date_val) // MS_PER_DAY
+    except (TypeError, ValueError):
+        return None
+
+
+def get_recent_star_records(client, days):
+    """读取 Stars 表最近 `days` 天的全部记录（按日期降序，越过窗口即停止）。
+
+    以现有数据为跟踪来源：既不依赖可能未配置的 GitHub org 发现，也不必全量扫描
+    整张历史表。返回窗口内的原始记录，调用方据此去重出仓库集合，并判断今日是否已写
+    （窗口内的今日记录可复用其 record_id 做更新，避免重复运行时重复写入）。
+    """
+    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BASE_TOKEN}/tables/{FEISHU_REPO_STARS_TABLE_ID}/records/search"
+    page_token = None
+    latest_day = None
+    records = []
+
+    while True:
+        payload = {
+            "page_size": 500,
+            "field_names": ["GitHub Repo", "日期"],
+            "sort": [{"field_name": "日期", "desc": True}],
+        }
+        if page_token:
+            payload["page_token"] = page_token
+        res = client.request("POST", url, json=payload)
+        if res.get("code") != 0:
+            raise RuntimeError(f"读取 Stars 近期记录失败: {res}")
+
+        reached_window_edge = False
+        for item in res.get("data", {}).get("items", []):
+            day = _day_key(item.get("fields", {}).get("日期"))
+            if day is None:
+                continue
+            if latest_day is None:
+                latest_day = day
+            if latest_day - day >= days:
+                reached_window_edge = True
+                break
+            records.append(item)
+
+        if reached_window_edge or not res.get("data", {}).get("has_more"):
+            break
+        page_token = res["data"].get("page_token")
+
+    return records
+
+
 def get_historical_model_tags(client, model_ids):
     """按 Model ID 服务端过滤查历史 Tag，避免扫描整张 Downloads 表。"""
     tags = DEFAULT_MODEL_TAGS.copy()
@@ -403,11 +466,14 @@ def main():
 
     # --- Stars 表 ---
     print("\n--- 更新 GitHub Stars ---")
-    star_records = get_today_records(client, False, today_start, today_end)
-    repos = set(get_github_repos())
-    print(f"GitHub 仓库列表共 {len(repos)} 个")
-    today_star_map = {}  # repo -> record_id
-    for item in star_records:
+    # 以「现有数据」为准：读取最近若干天已跟踪的仓库（去重），再每日刷新 star 数。
+    # 只取近期窗口（默认 7 天），不必全量扫描历史，也能抵御某天写入不完整；
+    # 窗口内的今日记录会复用其 record_id 做更新，避免重复运行时重复写入。
+    # 环境变量 GITHUB_REPOS 可补充尚未入库的新仓库。
+    recent_records = get_recent_star_records(client, STAR_LOOKBACK_DAYS)
+    repos = set()
+    today_star_map = {}  # repo -> record_id（窗口内属于今天的记录）
+    for item in recent_records:
         fields = item.get("fields", {})
         repo = extract_text(fields.get("GitHub Repo"))
         if not repo or repo == "Total":
@@ -416,8 +482,21 @@ def main():
         if is_today(fields.get("日期"), today_start, today_end):
             today_star_map[repo] = item["record_id"]
 
+    configured_repos = set(csv_env("GITHUB_REPOS"))
+    new_repos = sorted(configured_repos - repos, key=str.lower)
+    repos |= configured_repos
+
+    # 表为空（首次运行）时才回退到 GitHub 发现，避免依赖可能未配置的 org 发现
+    if not repos:
+        print("Stars 表暂无历史记录，回退到 GitHub 发现仓库")
+        repos = set(get_github_repos())
+
+    extra_hint = f"，环境变量新增 {len(new_repos)} 个" if new_repos else ""
+    print(f"GitHub 仓库列表共 {len(repos)} 个{extra_hint}")
+
     for repo in sorted(repos):
-        full_repo = f"{GITHUB_ORG}/{repo}"
+        # 支持 "owner/repo" 全称（跨组织仓库）或纯仓库名（默认挂在 GITHUB_ORG 下）
+        full_repo = repo if "/" in repo else f"{GITHUB_ORG}/{repo}"
         stars = get_github_star(full_repo)
         if stars is None:
             continue
